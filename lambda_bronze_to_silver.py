@@ -5,14 +5,52 @@ import logging
 import os
 import re
 import unicodedata
+from datetime import date
 from io import BytesIO
 from typing import Any
 
 import boto3
 import pandas as pd
 
+try:
+    from pypdf import PdfReader
+except Exception:  # noqa: BLE001
+    try:
+        from PyPDF2 import PdfReader
+    except Exception:  # noqa: BLE001
+        PdfReader = None
+
 SUPPORTED_EXTENSIONS = (".parquet", ".csv")
-DEFAULT_SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:050665165345:envio-email"
+PDF_EXTENSION = ".pdf"
+DEFAULT_SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:065272236984:envio-email-spay-g4"
+
+EXPECTED_PDF_FIELDS = [
+    "cnpj",
+    "type",
+    "nome_social",
+    "nome_comercial",
+    "status",
+    "telefone",
+    "cep",
+    "uf",
+    "municipio",
+    "bairro",
+    "complemento",
+    "logradouro",
+    "valor_patrimonio_liquido",
+    "data_inicio_situacao",
+    "data_registro",
+    "segmento_comercial_estimado",
+    "elegibilidade_lead_maquininha",
+    "porte_lead_estimado",
+    "potencial_venda_maquininha",
+    "faixa_volume_mensal_estimada",
+    "canal_abordagem_sugerido",
+]
+
+
+def only_digits(value: Any) -> str:
+    return re.sub(r"\D+", "", str(value or ""))
 
 
 def setup_logging(level: int = logging.INFO) -> None:
@@ -89,6 +127,25 @@ def list_bronze_objects(bronze_bucket: str, bronze_prefix: str, logger: logging.
     return objects
 
 
+def list_pdf_objects(bronze_bucket: str, bronze_prefix: str, logger: logging.Logger) -> list[dict]:
+    s3 = get_s3_client()
+    prefix = bronze_prefix or ""
+    objects: list[dict] = []
+
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bronze_bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj.get("Key", "")
+            if not key or key.endswith("/"):
+                continue
+            if not key.lower().endswith(PDF_EXTENSION):
+                continue
+            objects.append(obj)
+
+    logger.info("PDFs encontrados na bronze: %s", len(objects))
+    return objects
+
+
 def resolve_bronze_key(bronze_bucket: str, bronze_key: str, bronze_prefix: str, logger: logging.Logger) -> str:
     if bronze_key:
         return bronze_key
@@ -142,6 +199,137 @@ def resolve_optional_bronze_key_by_term(
     selected_key = str(candidates[0]["Key"])
     logger.info("Arquivo opcional selecionado automaticamente para '%s': %s", term, selected_key)
     return selected_key
+
+
+def resolve_latest_pdf_key(bronze_bucket: str, bronze_prefix: str, logger: logging.Logger) -> str | None:
+    objects = list_pdf_objects(bronze_bucket, bronze_prefix, logger)
+    if not objects:
+        return None
+
+    latest = max(
+        objects,
+        key=lambda item: float(item.get("LastModified").timestamp()) if item.get("LastModified") else 0,
+    )
+    return str(latest.get("Key", "")) or None
+
+
+def normalize_pdf_field_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            value = value.decode("latin-1", errors="ignore")
+    if isinstance(value, list):
+        return ", ".join(normalize_pdf_field_value(item) for item in value)
+    text = str(value).strip()
+    if text.startswith("/"):
+        text = text[1:]
+    return text
+
+
+def normalize_pdf_field_key(value: Any) -> str:
+    return normalize_column_name(str(value or "")).lower()
+
+
+def extract_pdf_form_fields(reader: Any) -> dict[str, str]:
+    fields = reader.get_fields() or {}
+    extracted: dict[str, str] = {}
+
+    for name, field in fields.items():
+        if field is None:
+            continue
+        value = field.get("/V") if hasattr(field, "get") else None
+        if value is None and hasattr(field, "get"):
+            value = field.get("/AS")
+        if value is None and hasattr(field, "get"):
+            value = field.get("V")
+        extracted[normalize_pdf_field_key(name)] = normalize_pdf_field_value(value)
+
+    return extracted
+
+
+def extract_pdf_text(reader: Any) -> str:
+    parts: list[str] = []
+    for page in getattr(reader, "pages", []) or []:
+        try:
+            text = page.extract_text()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            text = None
+        if text:
+            parts.append(str(text))
+    return "\n".join(parts)
+
+
+def parse_pdf_text_to_fields(text: str) -> dict[str, str]:
+    """Extrai campos do PDF a partir de texto (fallback quando nao ha formulario)."""
+
+    normalized_lines = [normalize_text(line).strip() for line in (text or "").splitlines()]
+    extracted: dict[str, str] = {}
+
+    for raw_line in normalized_lines:
+        if not raw_line:
+            continue
+
+        line = normalize_text(raw_line).lower()
+
+        for field in EXPECTED_PDF_FIELDS:
+            # Ex: "valor_patrimonio_liquido" casa com "valor patrimonio liquido".
+            pattern = r"^\s*" + re.escape(field).replace("_", r"[\s_]*") + r"\s*(?:[:\-]|=)\s*(.+?)\s*$"
+            match = re.match(pattern, line, flags=re.IGNORECASE)
+            if match:
+                extracted[field] = match.group(1).strip()
+
+    # Normaliza chaves do dicionario, caso o PDF traga variacoes.
+    normalized: dict[str, str] = {}
+    for key, value in extracted.items():
+        normalized[normalize_pdf_field_key(key)] = normalize_pdf_field_value(value)
+    return normalized
+
+
+def build_pdf_empresa_row(fields: dict[str, str], data_ingestao: str) -> dict[str, str]:
+    row: dict[str, str] = {}
+    for column in EXPECTED_PDF_FIELDS:
+        row[column] = normalize_pdf_field_value(fields.get(column, ""))
+    row["data_ingestao"] = normalize_pdf_field_value(fields.get("data_ingestao", data_ingestao))
+    return row
+
+
+def read_latest_pdf_from_s3(
+    bronze_bucket: str,
+    bronze_prefix: str,
+    logger: logging.Logger,
+) -> tuple[pd.DataFrame, str | None]:
+    latest_key = resolve_latest_pdf_key(bronze_bucket, bronze_prefix, logger)
+    if not latest_key:
+        logger.info("Nenhum PDF encontrado na bronze para leitura.")
+        return pd.DataFrame(), None
+
+    if PdfReader is None:
+        logger.warning("Biblioteca de leitura PDF nao disponivel (pypdf/PyPDF2). PDF sera ignorado.")
+        return pd.DataFrame(), latest_key
+
+    logger.info("Lendo ultimo PDF da bronze: s3://%s/%s", bronze_bucket, latest_key)
+    response = get_s3_client().get_object(Bucket=bronze_bucket, Key=latest_key)
+    raw = response["Body"].read()
+    metadata = response.get("Metadata", {}) or {}
+    data_ingestao = str(metadata.get("data_ingestao") or date.today().isoformat())
+
+    reader = PdfReader(BytesIO(raw))
+    fields = extract_pdf_form_fields(reader)
+
+    if not fields:
+        text = extract_pdf_text(reader)
+        if text:
+            fields = parse_pdf_text_to_fields(text)
+
+    if not fields:
+        logger.warning("Nao foi possivel extrair campos do PDF (formulario ou texto): %s", latest_key)
+        return pd.DataFrame(), latest_key
+
+    row = build_pdf_empresa_row(fields, data_ingestao=data_ingestao)
+    return pd.DataFrame([row]), latest_key
 
 
 def read_bronze_from_s3(
@@ -213,6 +401,9 @@ def clean_empresas_dataframe(df: pd.DataFrame, logger: logging.Logger) -> pd.Dat
     for col in df.columns:
         df[col] = df[col].apply(lambda value: "" if pd.isna(value) else normalize_text(value).upper())
 
+    if "CNPJ" in df.columns:
+        df["CNPJ"] = df["CNPJ"].apply(only_digits)
+
     before_rows = len(df)
     df = df.replace("", pd.NA)
     df = df.drop_duplicates().copy()
@@ -223,6 +414,25 @@ def clean_empresas_dataframe(df: pd.DataFrame, logger: logging.Logger) -> pd.Dat
     logger.info("Registros antes da limpeza: %s", before_rows)
     logger.info("Registros depois da limpeza: %s", after_rows)
     return df
+
+
+def deduplicate_empresas_by_cnpj(df: pd.DataFrame, logger: logging.Logger) -> pd.DataFrame:
+    if df.empty or "CNPJ" not in df.columns:
+        return df
+
+    cnpj_series = df["CNPJ"].astype(str)
+    nonempty_mask = cnpj_series.str.len().gt(0)
+
+    before_rows = len(df)
+    deduped_nonempty = df.loc[nonempty_mask].drop_duplicates(subset=["CNPJ"], keep="last")
+    remaining_empty = df.loc[~nonempty_mask]
+    combined = pd.concat([deduped_nonempty, remaining_empty], ignore_index=True)
+    after_rows = len(combined)
+
+    if after_rows != before_rows:
+        logger.info("Deduplicacao por CNPJ aplicada: %s -> %s", before_rows, after_rows)
+
+    return combined
 
 
 def dataframe_to_parquet_bytes(df: pd.DataFrame) -> bytes:
@@ -262,21 +472,49 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # no
     sns_topic_arn = DEFAULT_SNS_TOPIC_ARN
 
     try:
-        bronze_bucket = payload.get("bronze_bucket") or os.getenv("BRONZE_BUCKET", "grupo4-bronze")
+        bronze_bucket = payload.get("bronze_bucket") or os.getenv("BRONZE_BUCKET", "spay-g4-bronze")
         bronze_key = payload.get("bronze_key") or os.getenv("BRONZE_KEY", "")
         bronze_prefix = payload.get("bronze_prefix") or os.getenv("BRONZE_PREFIX", "")
         crm_bronze_key = payload.get("crm_bronze_key") or os.getenv("CRM_BRONZE_KEY", "")
+        pdf_bronze_prefix = payload.get("pdf_bronze_prefix") or os.getenv(
+            "PDF_BRONZE_PREFIX",
+            "relatorios_formulario/",
+        )
 
-        silver_bucket = payload.get("silver_bucket") or os.getenv("SILVER_BUCKET", "grupo4-silver")
+        silver_bucket = payload.get("silver_bucket") or os.getenv("SILVER_BUCKET", "spay-g4-silver")
         silver_prefix = payload.get("silver_prefix") or os.getenv("SILVER_PREFIX", "empresas/")
         crm_silver_prefix = payload.get("crm_silver_prefix") or os.getenv("CRM_SILVER_PREFIX", "crm_vendas/")
 
         empresas_bronze = read_bronze_from_s3(bronze_bucket, bronze_key, bronze_prefix, logger)
         total_empresas_bronze = len(empresas_bronze)
 
+        pdf_dataset = {
+            "processed": False,
+            "bronze_key": "",
+            "total_registros_pdf": 0,
+        }
+
+        pdf_df = pd.DataFrame()
+        try:
+            pdf_df, pdf_key = read_latest_pdf_from_s3(bronze_bucket, pdf_bronze_prefix, logger)
+            pdf_dataset = {
+                "processed": not pdf_df.empty,
+                "bronze_key": pdf_key or "",
+                "total_registros_pdf": len(pdf_df),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Falha ao ler PDF da bronze (sera ignorado): %s", exc)
+            pdf_df = pd.DataFrame()
+
+        if not pdf_df.empty:
+            empresas_bronze = pd.concat([empresas_bronze, pdf_df], ignore_index=True)
+
+        total_empresas_entrada = total_empresas_bronze + len(pdf_df)
+
         empresas_silver = clean_empresas_dataframe(empresas_bronze, logger)
+        empresas_silver = deduplicate_empresas_by_cnpj(empresas_silver, logger)
         total_empresas_silver = len(empresas_silver)
-        linhas_removidas = total_empresas_bronze - total_empresas_silver
+        linhas_removidas = total_empresas_entrada - total_empresas_silver
 
         silver_paths = salvar_silver_no_s3(empresas_silver, silver_bucket, silver_prefix, logger)
 
@@ -327,8 +565,10 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # no
             "bronze_bucket": bronze_bucket,
             "silver_bucket": silver_bucket,
             "silver_paths": silver_paths,
+            "pdf_dataset": pdf_dataset,
             "crm_dataset": crm_dataset,
             "total_empresas_bronze": total_empresas_bronze,
+            "total_empresas_entrada": total_empresas_entrada,
             "total_empresas_silver": total_empresas_silver,
             "linhas_removidas_durante_limpeza": linhas_removidas,
         }
@@ -341,9 +581,14 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # no
                 f"Bucket bronze: {bronze_bucket}\n"
                 f"Bucket silver: {silver_bucket}\n"
                 f"Registros bronze: {total_empresas_bronze}\n"
+                f"Registros entrada (bronze + PDF): {total_empresas_entrada}\n"
                 f"Registros silver: {total_empresas_silver}\n"
                 f"Linhas removidas: {linhas_removidas}\n"
                 f"Arquivos silver: {json.dumps(silver_paths, ensure_ascii=False)}\n\n"
+                "Processamento PDF:\n"
+                f"- Processado: {pdf_dataset['processed']}\n"
+                f"- Bronze key PDF: {pdf_dataset['bronze_key']}\n"
+                f"- Registros PDF: {pdf_dataset['total_registros_pdf']}\n\n"
                 "Processamento adicional CRM:\n"
                 f"- Processado: {crm_dataset['processed']}\n"
                 f"- Bronze key CRM: {crm_dataset['bronze_key']}\n"

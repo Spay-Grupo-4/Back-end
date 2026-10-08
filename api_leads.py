@@ -1,7 +1,10 @@
 import os
 import random
 import re
+import subprocess
+import sys
 import unicodedata
+import urllib.request
 from datetime import date
 from io import BytesIO
 
@@ -19,12 +22,40 @@ app = Flask(__name__)
 CORS(app)
 
 
-BRONZE_BUCKET = os.getenv("BRONZE_BUCKET", "grupo4-bronze")
+BRONZE_BUCKET = os.getenv("BRONZE_BUCKET", "spay-g4-bronze")
 BRONZE_PREFIX = os.getenv("BRONZE_PREFIX", "relatorios_formulario/")
-SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:050665165345:envio-email")
-SILVER_BUCKET = os.getenv("SILVER_BUCKET", "grupo4-silver")
+SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:065272236984:envio-email-spay-g4")
+SILVER_BUCKET = os.getenv("SILVER_BUCKET", "spay-g4-silver")
 SILVER_PREFIX = os.getenv("SILVER_PREFIX", "empresas/")
 SILVER_KEY = os.getenv("SILVER_KEY", f"{SILVER_PREFIX.rstrip('/')}/empresas_tratadas.parquet")
+GOLD_BUCKET = os.getenv("GOLD_BUCKET", "spay-g4-gold")
+RELATORIOS_PREFIX = os.getenv("RELATORIOS_PREFIX", "relatorios/")
+RELATORIOS_LIST_PREFIX = os.getenv("RELATORIOS_LIST_PREFIX", "relatorios/relatorios-vendas/")
+RELATORIOS_DADOS_LIST_PREFIX = os.getenv("RELATORIOS_DADOS_LIST_PREFIX", "relatorios/relatorios-dados/")
+RELATORIOS_CRM_CLIENTES_LIST_PREFIX = os.getenv(
+    "RELATORIOS_CRM_CLIENTES_LIST_PREFIX",
+    "relatorios/relatorios-clientes/",
+)
+RELATORIOS_CRM_LEADS_LIST_PREFIX = os.getenv(
+    "RELATORIOS_CRM_LEADS_LIST_PREFIX",
+    "relatorios/relatorios-leads/",
+)
+RELATORIOS_KEY = os.getenv("RELATORIOS_KEY", "relatorios/relatorio_metricas_vendas.pdf")
+RELATORIOS_DADOS_KEY = os.getenv("RELATORIOS_DADOS_KEY", "relatorios/relatorios-dados/")
+RELATORIOS_CRM_CLIENTES_KEY = os.getenv("RELATORIOS_CRM_CLIENTES_KEY", "relatorios/relatorios-clientes/")
+RELATORIOS_CRM_LEADS_KEY = os.getenv("RELATORIOS_CRM_LEADS_KEY", "relatorios/relatorios-leads/")
+SCRIPT_VENDAS = os.getenv("SCRIPT_VENDAS", "Script_relatorio_vendas.py")
+SCRIPT_DADOS = os.getenv("SCRIPT_DADOS", "gerar_relatorio_dados.py")
+SCRIPT_CRM_CLIENTES = os.getenv("SCRIPT_CRM_CLIENTES", "gerar_relatorio_crm_clientes.py")
+SCRIPT_CRM_LEADS = os.getenv("SCRIPT_CRM_LEADS", "relatorio_crm_leads.py")
+
+AUTH_CREDENTIALS = {
+    "admin": {"password": "admin123", "area": "Administrador"},
+    "crmleads": {"password": "leads123", "area": "CRM Leads"},
+    "vendas": {"password": "vendas123", "area": "Vendas"},
+    "crmclientes": {"password": "clientes123", "area": "CRM Clientes"},
+    "dados": {"password": "dados123", "area": "Dados"},
+}
 
 
 def get_s3_client():
@@ -44,6 +75,40 @@ def get_sns_client():
         raise RuntimeError("boto3 nao disponivel para operacoes SNS na API")
 
     return boto3.client("sns")
+
+
+def get_ec2_instance_id() -> str:
+    """Busca o instance-id da EC2 via metadata."""
+
+    url = "http://169.254.169.254/latest/meta-data/instance-id"
+    with urllib.request.urlopen(url, timeout=2) as response:  # noqa: S310
+        instance_id = response.read().decode("utf-8").strip()
+
+    if not instance_id:
+        raise RuntimeError("instance-id nao encontrado")
+
+    return instance_id
+
+
+def get_ec2_public_ipv4() -> str:
+    """Busca o IPv4 publico da EC2 usando boto3."""
+
+    if boto3 is None:
+        raise RuntimeError("boto3 nao disponivel para operacoes EC2 na API")
+
+    instance_id = get_ec2_instance_id()
+    ec2 = boto3.client("ec2")
+    response = ec2.describe_instances(InstanceIds=[instance_id])
+    reservations = response.get("Reservations", [])
+    instances = reservations[0].get("Instances", []) if reservations else []
+    if not instances:
+        raise RuntimeError("instancia nao encontrada no EC2")
+
+    public_ip = instances[0].get("PublicIpAddress")
+    if not public_ip:
+        raise RuntimeError("IPv4 publico nao disponivel para a instancia")
+
+    return public_ip
 
 
 def notify_success_to_sns(subject: str, message: str) -> None:
@@ -149,6 +214,95 @@ def clean_empresas_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def normalize_login(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
+def validate_login(username: str | None, password: str | None) -> dict | None:
+    user_key = normalize_login(username)
+    if not user_key:
+        return None
+
+    record = AUTH_CREDENTIALS.get(user_key)
+    if not record:
+        return None
+
+    if record["password"] != (password or ""):
+        return None
+
+    return {"username": user_key, "area": record["area"]}
+
+
+def is_vendas_user(payload: dict) -> bool:
+    username = normalize_login(payload.get("username"))
+    area = (payload.get("area") or "").strip().lower()
+    return username == "vendas" or area == "vendas"
+
+
+def is_dados_user(payload: dict) -> bool:
+    username = normalize_login(payload.get("username"))
+    area = (payload.get("area") or "").strip().lower()
+    return username == "dados" or area == "dados"
+
+
+def is_crm_clientes_user(payload: dict) -> bool:
+    username = normalize_login(payload.get("username"))
+    area = (payload.get("area") or "").strip().lower()
+    return username == "crmclientes" or area == "crm clientes"
+
+
+def is_crm_leads_user(payload: dict) -> bool:
+    username = normalize_login(payload.get("username"))
+    area = (payload.get("area") or "").strip().lower()
+    return username == "crmleads" or area == "crm leads"
+
+
+def list_reports_from_s3(prefix: str, limit: int | None = None) -> list[dict]:
+    s3 = get_s3_client()
+    clean_prefix = prefix.rstrip("/") + "/"
+    paginator = s3.get_paginator("list_objects_v2")
+    contents = (
+        item
+        for page in paginator.paginate(Bucket=GOLD_BUCKET, Prefix=clean_prefix)
+        for item in page.get("Contents", [])
+    )
+    items = [
+        item
+        for item in contents
+        if item.get("Key") and not item["Key"].endswith("/")
+    ]
+    items.sort(
+        key=lambda item: item.get("LastModified").timestamp()
+        if item.get("LastModified")
+        else 0,
+        reverse=True,
+    )
+    if limit is not None:
+        items = items[:limit]
+
+    results = []
+
+    for item in items:
+        key = item.get("Key", "")
+
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": GOLD_BUCKET, "Key": key},
+            ExpiresIn=3600,
+        )
+        results.append(
+            {
+                "key": key,
+                "name": key.split("/")[-1],
+                "last_modified": item.get("LastModified").isoformat() if item.get("LastModified") else "",
+                "size": int(item.get("Size", 0)),
+                "url": url,
+            }
+        )
+
+    return results
+
+
 def choose_weighted(options: list[str], weights: list[int]) -> str:
     return random.choices(options, weights=weights, k=1)[0]
 
@@ -248,34 +402,28 @@ def build_auto_lead_fields(row: dict, patrimonio: float | None) -> dict:
     }
 
 
-def merge_lead_with_silver_parquet_s3(df_novo: pd.DataFrame) -> dict:
-    """Recebe um DF de lead manual, trata como silver e faz merge por CNPJ no parquet silver.
-
-    Sobrescreve o parquet mantendo o registro mais recente por CNPJ.
-    """
+def upload_lead_to_bronze_parquet(df_novo: pd.DataFrame) -> dict:
+    """Envia o cadastro manual para o Parquet da bronze, mantendo historico."""
 
     if boto3 is None:
         raise RuntimeError("boto3 nao disponivel para operacoes S3 na API")
 
-    if not SILVER_BUCKET or not SILVER_KEY:
-        raise RuntimeError("SILVER_BUCKET ou SILVER_KEY nao definidos para merge na silver")
+    if not BRONZE_BUCKET:
+        raise RuntimeError("BRONZE_BUCKET nao definido para envio na bronze")
 
-    df_novo = clean_empresas_dataframe(df_novo.copy())
+    df_novo = df_novo.copy()
+    if "cnpj" in df_novo.columns:
+        df_novo["cnpj"] = df_novo["cnpj"].apply(only_digits)
 
-    if "CNPJ" not in df_novo.columns:
-        raise ValueError("Dados nao possuem coluna 'CNPJ' para usar como chave de merge")
-
-    df_novo["CNPJ"] = df_novo["CNPJ"].astype(str)
+    object_name = "dados-empresas-projeto.parquet"
+    key = object_name
 
     s3 = get_s3_client()
 
-    # Tenta ler Parquet antigo da silver (se existir)
     try:
-        resp = s3.get_object(Bucket=SILVER_BUCKET, Key=SILVER_KEY)
-        antigo_bytes = resp["Body"].read()
-        df_antigo = pd.read_parquet(BytesIO(antigo_bytes))
-        if "CNPJ" in df_antigo.columns:
-            df_antigo["CNPJ"] = df_antigo["CNPJ"].astype(str)
+        resp = s3.get_object(Bucket=BRONZE_BUCKET, Key=key)
+        raw = resp["Body"].read()
+        df_antigo = pd.read_parquet(BytesIO(raw))
     except s3.exceptions.NoSuchKey:  # type: ignore[attr-defined]
         df_antigo = pd.DataFrame()
     except Exception as exc:  # noqa: BLE001
@@ -285,34 +433,48 @@ def merge_lead_with_silver_parquet_s3(df_novo: pd.DataFrame) -> dict:
         else:
             raise
 
-    # Concatena antigo + novo e remove duplicados por CNPJ, mantendo o mais recente
     if not df_antigo.empty:
-        combinado = pd.concat([df_antigo, df_novo], ignore_index=True)
-    else:
-        combinado = df_novo.copy()
+        for col in df_antigo.columns:
+            if col not in df_novo.columns:
+                df_novo[col] = ""
+        for col in df_novo.columns:
+            if col not in df_antigo.columns:
+                df_antigo[col] = ""
 
-    combinado = clean_empresas_dataframe(combinado)
-    combinado = combinado.drop_duplicates(subset=["CNPJ"], keep="last").reset_index(drop=True)
+        for col in df_antigo.columns:
+            dtype = df_antigo[col].dtype
+            if pd.api.types.is_numeric_dtype(dtype):
+                df_novo[col] = pd.to_numeric(df_novo[col], errors="coerce")
+            elif pd.api.types.is_datetime64_any_dtype(dtype):
+                df_novo[col] = pd.to_datetime(df_novo[col], errors="coerce")
+            else:
+                df_novo[col] = df_novo[col].where(df_novo[col].notna(), "")
+                df_novo[col] = df_novo[col].astype(str)
 
-    # Salva de volta em Parquet na silver
+    combinado = pd.concat([df_antigo, df_novo], ignore_index=True) if not df_antigo.empty else df_novo.copy()
+
     buffer = BytesIO()
     combinado.to_parquet(buffer, index=False)
     buffer.seek(0)
 
-    s3.put_object(Bucket=SILVER_BUCKET, Key=SILVER_KEY, Body=buffer.read())
+    s3.put_object(
+        Bucket=BRONZE_BUCKET,
+        Key=key,
+        Body=buffer.read(),
+    )
 
     return {
-        "bucket": SILVER_BUCKET,
-        "key": SILVER_KEY,
-        "linhas_novas": len(df_novo),
-        "linhas_antigas": len(df_antigo),
+        "bucket": BRONZE_BUCKET,
+        "key": key,
+        "linhas_enviadas": len(df_novo),
+        "linhas_anteriores": len(df_antigo),
         "linhas_finais": len(combinado),
     }
 
 
 @app.post("/leads")
 def criar_lead():
-    """Recebe um lead do front-end e salva direto na silver (parquet tratado)."""
+    """Recebe um lead do front-end e envia para a bronze em CSV."""
     data = request.get_json(silent=True) or {}
 
     required_fields = [
@@ -358,25 +520,25 @@ def criar_lead():
     df = pd.DataFrame([row])
 
     try:
-        resultado = merge_lead_with_silver_parquet_s3(df)
+        resultado = upload_lead_to_bronze_parquet(df)
     except Exception as exc:  # noqa: BLE001
-        app.logger.exception("Falha ao tratar e salvar lead na silver: %s", exc)
+        app.logger.exception("Falha ao enviar lead para bronze: %s", exc)
         return (
             jsonify({
                 "success": False,
-                "message": f"Erro ao tratar e salvar lead na silver: {exc}",
+                "message": f"Erro ao enviar lead para bronze: {exc}",
             }),
             500,
         )
 
     notify_success_to_sns(
-        subject="[API Leads] Lead manual salvo com sucesso na silver",
+        subject="[API Leads] Lead manual enviado com sucesso para bronze",
         message=(
             "Cadastro manual concluido com sucesso via endpoint /leads.\n\n"
-            f"Bucket silver: {resultado['bucket']}\n"
-            f"Chave silver: {resultado['key']}\n"
-            f"Linhas novas: {resultado['linhas_novas']}\n"
-            f"Linhas antigas: {resultado['linhas_antigas']}\n"
+            f"Bucket bronze: {resultado['bucket']}\n"
+            f"Chave bronze: {resultado['key']}\n"
+            f"Linhas enviadas: {resultado['linhas_enviadas']}\n"
+            f"Linhas anteriores: {resultado['linhas_anteriores']}\n"
             f"Linhas finais: {resultado['linhas_finais']}\n"
             f"CNPJ: {row['cnpj']}"
         ),
@@ -384,9 +546,229 @@ def criar_lead():
 
     return jsonify({
         "success": True,
-        "message": "Lead tratado e salvo com sucesso na silver.",
+        "message": "Lead enviado com sucesso para bronze.",
         "details": resultado,
     })
+
+
+@app.post("/auth/login")
+def auth_login():
+    data = request.get_json(silent=True) or {}
+    username = data.get("username")
+    password = data.get("password")
+
+    if not username or not password:
+        return (
+            jsonify({
+                "success": False,
+                "message": "Usuario e senha sao obrigatorios.",
+            }),
+            400,
+        )
+
+    auth = validate_login(username, password)
+    if not auth:
+        return (
+            jsonify({
+                "success": False,
+                "message": "Usuario ou senha invalidos.",
+            }),
+            401,
+        )
+
+    return jsonify({
+        "success": True,
+        "message": "Login realizado com sucesso.",
+        "user": auth,
+    })
+
+
+@app.post("/relatorios/solicitar")
+def solicitar_relatorio_vendas():
+    payload = request.get_json(silent=True) or {}
+    if not is_vendas_user(payload):
+        return jsonify({"success": False, "message": "Acesso restrito ao usuario de Vendas."}), 403
+
+    try:
+        script_path = os.path.join(os.path.dirname(__file__), SCRIPT_VENDAS)
+        result = subprocess.run(
+            [sys.executable, script_path],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        return (
+            jsonify({
+                "success": False,
+                "message": "Falha ao gerar relatorio.",
+                "error": exc.stderr or str(exc),
+            }),
+            500,
+        )
+
+    return jsonify({
+        "success": True,
+        "message": "Relatorio gerado e enviado para o S3.",
+        "s3_uri": f"s3://{GOLD_BUCKET}/relatorios/relatorios-vendas/",
+        "logs": result.stdout.strip(),
+    })
+
+
+@app.post("/relatorios/listar")
+def listar_relatorios_vendas():
+    payload = request.get_json(silent=True) or {}
+    if not is_vendas_user(payload):
+        return jsonify({"success": False, "message": "Acesso restrito ao usuario de Vendas."}), 403
+
+    try:
+        reports = list_reports_from_s3(RELATORIOS_LIST_PREFIX)
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("Falha ao listar relatorios do S3: %s", exc)
+        return jsonify({"success": False, "message": f"Erro ao listar relatorios: {exc}"}), 500
+
+    return jsonify({"success": True, "reports": reports})
+
+
+@app.post("/relatorios/dados/solicitar")
+def solicitar_relatorio_dados():
+    payload = request.get_json(silent=True) or {}
+    if not is_dados_user(payload):
+        return jsonify({"success": False, "message": "Acesso restrito ao usuario de Dados."}), 403
+
+    try:
+        script_path = os.path.join(os.path.dirname(__file__), SCRIPT_DADOS)
+        result = subprocess.run(
+            [sys.executable, script_path],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        return (
+            jsonify({
+                "success": False,
+                "message": "Falha ao gerar relatorio de dados.",
+                "error": exc.stderr or str(exc),
+            }),
+            500,
+        )
+
+    return jsonify({
+        "success": True,
+        "message": "Relatorio de dados gerado e enviado para o S3.",
+        "s3_uri": f"s3://{GOLD_BUCKET}/{RELATORIOS_DADOS_KEY}",
+        "logs": result.stdout.strip(),
+    })
+
+
+@app.post("/relatorios/dados/listar")
+def listar_relatorios_dados():
+    payload = request.get_json(silent=True) or {}
+    if not is_dados_user(payload):
+        return jsonify({"success": False, "message": "Acesso restrito ao usuario de Dados."}), 403
+
+    try:
+        reports = list_reports_from_s3(RELATORIOS_DADOS_LIST_PREFIX)
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("Falha ao listar relatorios do S3: %s", exc)
+        return jsonify({"success": False, "message": f"Erro ao listar relatorios: {exc}"}), 500
+
+    return jsonify({"success": True, "reports": reports})
+
+
+@app.post("/relatorios/crm/solicitar")
+def solicitar_relatorio_crm_clientes():
+    payload = request.get_json(silent=True) or {}
+    if not is_crm_clientes_user(payload):
+        return jsonify({"success": False, "message": "Acesso restrito ao usuario de CRM Clientes."}), 403
+
+    try:
+        script_path = os.path.join(os.path.dirname(__file__), SCRIPT_CRM_CLIENTES)
+        result = subprocess.run(
+            [sys.executable, script_path],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        return (
+            jsonify({
+                "success": False,
+                "message": "Falha ao gerar relatorio de CRM Clientes.",
+                "error": exc.stderr or str(exc),
+            }),
+            500,
+        )
+
+    return jsonify({
+        "success": True,
+        "message": "Relatorio de CRM Clientes gerado e enviado para o S3.",
+        "s3_uri": f"s3://{GOLD_BUCKET}/{RELATORIOS_CRM_CLIENTES_KEY}",
+        "logs": result.stdout.strip(),
+    })
+
+
+@app.post("/relatorios/crm/listar")
+def listar_relatorios_crm_clientes():
+    payload = request.get_json(silent=True) or {}
+    if not is_crm_clientes_user(payload):
+        return jsonify({"success": False, "message": "Acesso restrito ao usuario de CRM Clientes."}), 403
+
+    try:
+        reports = list_reports_from_s3(RELATORIOS_CRM_CLIENTES_LIST_PREFIX)
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("Falha ao listar relatorios do S3: %s", exc)
+        return jsonify({"success": False, "message": f"Erro ao listar relatorios: {exc}"}), 500
+
+    return jsonify({"success": True, "reports": reports})
+
+
+@app.post("/relatorios/crm-leads/solicitar")
+def solicitar_relatorio_crm_leads():
+    payload = request.get_json(silent=True) or {}
+    if not is_crm_leads_user(payload):
+        return jsonify({"success": False, "message": "Acesso restrito ao usuario de CRM Leads."}), 403
+
+    try:
+        script_path = os.path.join(os.path.dirname(__file__), SCRIPT_CRM_LEADS)
+        result = subprocess.run(
+            [sys.executable, script_path],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        return (
+            jsonify({
+                "success": False,
+                "message": "Falha ao gerar relatorio de CRM Leads.",
+                "error": exc.stderr or str(exc),
+            }),
+            500,
+        )
+
+    return jsonify({
+        "success": True,
+        "message": "Relatorio de CRM Leads gerado e enviado para o S3.",
+        "s3_uri": f"s3://{GOLD_BUCKET}/{RELATORIOS_CRM_LEADS_KEY}",
+        "logs": result.stdout.strip(),
+    })
+
+
+@app.post("/relatorios/crm-leads/listar")
+def listar_relatorios_crm_leads():
+    payload = request.get_json(silent=True) or {}
+    if not is_crm_leads_user(payload):
+        return jsonify({"success": False, "message": "Acesso restrito ao usuario de CRM Leads."}), 403
+
+    try:
+        reports = list_reports_from_s3(RELATORIOS_CRM_LEADS_LIST_PREFIX)
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("Falha ao listar relatorios do S3: %s", exc)
+        return jsonify({"success": False, "message": f"Erro ao listar relatorios: {exc}"}), 500
+
+    return jsonify({"success": True, "reports": reports})
 
 
 @app.post("/upload_pdf")
@@ -450,6 +832,19 @@ def upload_pdf():
         "pdf_s3_path": pdf_s3_path,
         "data_ingestao": data_ingestao,
     })
+
+
+@app.get("/infra/ec2-ipv4")
+def get_infra_ec2_ipv4():
+    """Retorna o IPv4 publico da EC2 atual."""
+
+    try:
+        public_ip = get_ec2_public_ipv4()
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("Falha ao obter IPv4 da EC2: %s", exc)
+        return jsonify({"success": False, "message": str(exc)}), 500
+
+    return jsonify({"success": True, "ipv4": public_ip})
 
 
 if __name__ == "__main__":

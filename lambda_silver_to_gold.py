@@ -4,13 +4,14 @@ import json
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any
 
 import boto3
 import pandas as pd
 
-DEFAULT_SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:050665165345:envio-email"
+DEFAULT_SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:065272236984:envio-email-spay-g4"
 
 
 def setup_logging(level: int = logging.INFO) -> None:
@@ -127,6 +128,533 @@ def parse_faixa_volume_to_midpoint(series: pd.Series) -> pd.Series:
     midpoint = midpoint.fillna(above_value * 1000)
 
     return midpoint
+
+
+def is_non_empty_text(series: pd.Series) -> pd.Series:
+    return series.fillna("").astype(str).str.strip().ne("")
+
+
+def map_potencial_to_score(series: pd.Series) -> pd.Series:
+    mapping = {
+        "ALTO": 3,
+        "MEDIO": 2,
+        "BAIXO": 1,
+    }
+    return series.fillna("").astype(str).str.strip().str.upper().map(mapping).fillna(0).astype(float)
+
+
+def map_elegibilidade_to_score(series: pd.Series) -> pd.Series:
+    mapping = {
+        "ELEGIVEL": 1,
+    }
+    return series.fillna("").astype(str).str.strip().str.upper().map(mapping).fillna(0).astype(float)
+
+
+def map_porte_to_score(series: pd.Series) -> pd.Series:
+    mapping = {
+        "MICRO": 1,
+        "PEQUENO": 2,
+        "PEQUENA": 2,
+        "MEDIO": 3,
+        "GRANDE": 4,
+    }
+    return series.fillna("").astype(str).str.strip().str.upper().map(mapping).fillna(0).astype(float)
+
+
+def bucketize_score(score: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(score, errors="coerce")
+    bins = [-0.01, 20, 40, 60, 80, 100]
+    labels = ["0_20", "21_40", "41_60", "61_80", "81_100"]
+    return pd.cut(numeric, bins=bins, labels=labels).astype(str).replace("nan", "")
+
+
+def build_kpis_projeto(empresas_silver: pd.DataFrame, crm_silver: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    emp = empresas_silver.copy()
+    crm = crm_silver.copy()
+
+    status_col = "STATUS"
+    uf_col = "UF"
+    municipio_col = "MUNICIPIO"
+    segmento_col = "SEGMENTO_COMERCIAL_ESTIMADO"
+    cnpj_col = "CNPJ"
+    telefone_col = "TELEFONE"
+    canal_col = "CANAL_ABORDAGEM_SUGERIDO"
+    eleg_col = "ELEGIBILIDADE_LEAD_MAQUININHA"
+    pot_col = "POTENCIAL_VENDA_MAQUININHA"
+    porte_col = "PORTE_LEAD_ESTIMADO"
+    faixa_volume_col = "FAIXA_VOLUME_MENSAL_ESTIMADA"
+    data_ingestao_col = "DATA_INGESTAO"
+
+    active = emp.copy()
+    if status_col in emp.columns:
+        active = emp.loc[emp[status_col] == "ATIVA"].copy()
+    else:
+        active = emp.iloc[0:0].copy()
+
+    volume_mid_active = pd.Series(dtype="float64")
+    if not active.empty and faixa_volume_col in active.columns:
+        volume_mid_active = parse_faixa_volume_to_midpoint(active[faixa_volume_col])
+
+    volume_potencial_por_uf_segmento = pd.DataFrame(
+        columns=["UF", "SEGMENTO_COMERCIAL_ESTIMADO", "TOTAL_EMPRESAS", "VOLUME_POTENCIAL_MENSAL_ESTIMADO"]
+    )
+    if not active.empty and uf_col in active.columns and segmento_col in active.columns and not volume_mid_active.empty:
+        aux = active[[uf_col, segmento_col]].copy()
+        aux["VOLUME_POTENCIAL_MENSAL_ESTIMADO"] = volume_mid_active
+        volume_potencial_por_uf_segmento = (
+            aux.groupby([uf_col, segmento_col], dropna=False)
+            .agg(
+                TOTAL_EMPRESAS=(uf_col, "size"),
+                VOLUME_POTENCIAL_MENSAL_ESTIMADO=("VOLUME_POTENCIAL_MENSAL_ESTIMADO", "sum"),
+            )
+            .reset_index()
+            .rename(columns={uf_col: "UF", segmento_col: "SEGMENTO_COMERCIAL_ESTIMADO"})
+            .sort_values("VOLUME_POTENCIAL_MENSAL_ESTIMADO", ascending=False)
+        )
+
+    top_municipios_por_volume_potencial = pd.DataFrame(
+        columns=["MUNICIPIO", "TOTAL_EMPRESAS", "VOLUME_POTENCIAL_MENSAL_ESTIMADO"]
+    )
+    if not active.empty and municipio_col in active.columns and not volume_mid_active.empty:
+        aux = active[[municipio_col]].copy()
+        aux["VOLUME_POTENCIAL_MENSAL_ESTIMADO"] = volume_mid_active
+        top_municipios_por_volume_potencial = (
+            aux.groupby(municipio_col, dropna=False)
+            .agg(
+                TOTAL_EMPRESAS=(municipio_col, "size"),
+                VOLUME_POTENCIAL_MENSAL_ESTIMADO=("VOLUME_POTENCIAL_MENSAL_ESTIMADO", "sum"),
+            )
+            .reset_index()
+            .rename(columns={municipio_col: "MUNICIPIO"})
+            .sort_values(["VOLUME_POTENCIAL_MENSAL_ESTIMADO", "TOTAL_EMPRESAS"], ascending=[False, False])
+            .head(20)
+        )
+
+    segmentos_maior_ticket_medio = pd.DataFrame(
+        columns=[
+            "SEGMENTO_COMERCIAL_ESTIMADO",
+            "TOTAL_EMPRESAS",
+            "VOLUME_POTENCIAL_MENSAL_ESTIMADO_TOTAL",
+            "TICKET_MEDIO_ESTIMADO",
+        ]
+    )
+    if not active.empty and segmento_col in active.columns and not volume_mid_active.empty:
+        aux = active[[segmento_col]].copy()
+        aux["VOLUME_POTENCIAL_MENSAL_ESTIMADO"] = volume_mid_active
+        segmentos_maior_ticket_medio = (
+            aux.groupby(segmento_col, dropna=False)
+            .agg(
+                TOTAL_EMPRESAS=(segmento_col, "size"),
+                VOLUME_POTENCIAL_MENSAL_ESTIMADO_TOTAL=("VOLUME_POTENCIAL_MENSAL_ESTIMADO", "sum"),
+                TICKET_MEDIO_ESTIMADO=("VOLUME_POTENCIAL_MENSAL_ESTIMADO", "mean"),
+            )
+            .reset_index()
+            .rename(columns={segmento_col: "SEGMENTO_COMERCIAL_ESTIMADO"})
+            .sort_values("TICKET_MEDIO_ESTIMADO", ascending=False)
+        )
+        segmentos_maior_ticket_medio["TICKET_MEDIO_ESTIMADO"] = segmentos_maior_ticket_medio["TICKET_MEDIO_ESTIMADO"].round(2)
+
+    volume_leads_contataveis_por_uf_segmento = pd.DataFrame(
+        columns=["UF", "SEGMENTO_COMERCIAL_ESTIMADO", "TOTAL_CNPJ_CONTATAVEIS", "TOTAL_CNPJ_TELEFONE_VALIDO"]
+    )
+    if not active.empty and cnpj_col in active.columns and telefone_col in active.columns and uf_col in active.columns and segmento_col in active.columns:
+        telefone_preenchido = is_non_empty_text(active[telefone_col])
+        tel_valido = is_valid_phone(active[telefone_col])
+        base = active.loc[telefone_preenchido].copy()
+        if not base.empty:
+            base["TELEFONE_VALIDO"] = tel_valido.loc[base.index]
+            volume_leads_contataveis_por_uf_segmento = (
+                base.groupby([uf_col, segmento_col], dropna=False)
+                .agg(
+                    TOTAL_CNPJ_CONTATAVEIS=(cnpj_col, "nunique"),
+                    TOTAL_CNPJ_TELEFONE_VALIDO=("TELEFONE_VALIDO", lambda s: int(s.fillna(False).astype(bool).sum())),
+                )
+                .reset_index()
+                .rename(columns={uf_col: "UF", segmento_col: "SEGMENTO_COMERCIAL_ESTIMADO"})
+                .sort_values("TOTAL_CNPJ_CONTATAVEIS", ascending=False)
+            )
+
+    percentual_leads_prontos_contato = pd.DataFrame(columns=["TOTAL_ATIVAS", "TOTAL_PRONTAS", "PERCENTUAL_PRONTAS"])
+    if not active.empty:
+        total_ativas = len(active)
+        tel_ok = is_non_empty_text(active[telefone_col]) if telefone_col in active.columns else pd.Series([False] * len(active), index=active.index)
+        seg_ok = is_non_empty_text(active[segmento_col]) if segmento_col in active.columns else pd.Series([False] * len(active), index=active.index)
+        canal_ok = is_non_empty_text(active[canal_col]) if canal_col in active.columns else pd.Series([False] * len(active), index=active.index)
+        prontas = (tel_ok & seg_ok & canal_ok).sum()
+        percentual = round((prontas / total_ativas) * 100, 2) if total_ativas else 0
+        percentual_leads_prontos_contato = pd.DataFrame(
+            [{"TOTAL_ATIVAS": int(total_ativas), "TOTAL_PRONTAS": int(prontas), "PERCENTUAL_PRONTAS": percentual}]
+        )
+
+    distribuicao_leads_potencial_venda = pd.DataFrame(columns=["POTENCIAL_VENDA_MAQUININHA", "TOTAL_EMPRESAS"])
+    if not active.empty and pot_col in active.columns:
+        distribuicao_leads_potencial_venda = (
+            active[pot_col]
+            .value_counts(dropna=False)
+            .rename_axis("POTENCIAL_VENDA_MAQUININHA")
+            .reset_index(name="TOTAL_EMPRESAS")
+        )
+
+    percentual_leads_elegiveis = pd.DataFrame(columns=["TOTAL_ATIVAS", "TOTAL_ELEGIVEIS", "PERCENTUAL_ELEGIVEIS"])
+    if not active.empty and eleg_col in active.columns:
+        total_ativas = len(active)
+        total_elegiveis = int((active[eleg_col] == "ELEGIVEL").sum())
+        percentual = round((total_elegiveis / total_ativas) * 100, 2) if total_ativas else 0
+        percentual_leads_elegiveis = pd.DataFrame(
+            [{"TOTAL_ATIVAS": int(total_ativas), "TOTAL_ELEGIVEIS": total_elegiveis, "PERCENTUAL_ELEGIVEIS": percentual}]
+        )
+
+    score_prioridade_comercial = pd.DataFrame(
+        columns=[
+            "CNPJ",
+            "SCORE_PRIORIDADE_COMERCIAL",
+            "VOLUME_POTENCIAL_MENSAL_ESTIMADO",
+            "POTENCIAL_VENDA_MAQUININHA",
+            "ELEGIBILIDADE_LEAD_MAQUININHA",
+            "PORTE_LEAD_ESTIMADO",
+            "UF",
+            "MUNICIPIO",
+            "SEGMENTO_COMERCIAL_ESTIMADO",
+        ]
+    )
+    if not active.empty and cnpj_col in active.columns:
+        w_pot = float(os.getenv("KPI_PESO_POTENCIAL", "1"))
+        w_eleg = float(os.getenv("KPI_PESO_ELEGIBILIDADE", "1"))
+        w_porte = float(os.getenv("KPI_PESO_PORTE", "1"))
+
+        aux = active.copy()
+        if not volume_mid_active.empty:
+            aux["VOLUME_POTENCIAL_MENSAL_ESTIMADO"] = volume_mid_active
+        else:
+            aux["VOLUME_POTENCIAL_MENSAL_ESTIMADO"] = pd.NA
+
+        pot_score = map_potencial_to_score(aux.get(pot_col, pd.Series([""] * len(aux), index=aux.index)))
+        eleg_score = map_elegibilidade_to_score(aux.get(eleg_col, pd.Series([""] * len(aux), index=aux.index)))
+        porte_score = map_porte_to_score(aux.get(porte_col, pd.Series([""] * len(aux), index=aux.index)))
+        aux["SCORE_PRIORIDADE_COMERCIAL"] = (w_pot * pot_score) + (w_eleg * eleg_score) + (w_porte * porte_score)
+
+        cols = [
+            cnpj_col,
+            "SCORE_PRIORIDADE_COMERCIAL",
+            "VOLUME_POTENCIAL_MENSAL_ESTIMADO",
+            pot_col,
+            eleg_col,
+            porte_col,
+            uf_col,
+            municipio_col,
+            segmento_col,
+        ]
+        existing_cols = [c for c in cols if c in aux.columns]
+        score_prioridade_comercial = (
+            aux[existing_cols]
+            .rename(
+                columns={
+                    cnpj_col: "CNPJ",
+                    pot_col: "POTENCIAL_VENDA_MAQUININHA",
+                    eleg_col: "ELEGIBILIDADE_LEAD_MAQUININHA",
+                    porte_col: "PORTE_LEAD_ESTIMADO",
+                    uf_col: "UF",
+                    municipio_col: "MUNICIPIO",
+                    segmento_col: "SEGMENTO_COMERCIAL_ESTIMADO",
+                }
+            )
+            .sort_values(["SCORE_PRIORIDADE_COMERCIAL", "VOLUME_POTENCIAL_MENSAL_ESTIMADO"], ascending=[False, False])
+        )
+
+    data_validos_por_data_ingestao = pd.DataFrame(
+        columns=["DATA_INGESTAO", "CNPJ_VALIDO_PERCENTUAL", "TELEFONE_VALIDO_PERCENTUAL", "DADOS_VALIDOS_PERCENTUAL"]
+    )
+    if data_ingestao_col in emp.columns and cnpj_col in emp.columns and telefone_col in emp.columns:
+        data_ing = pd.to_datetime(emp[data_ingestao_col], errors="coerce")
+        aux = emp.loc[data_ing.notna()].copy()
+        if not aux.empty:
+            aux["DATA_INGESTAO"] = data_ing.loc[aux.index].dt.date.astype(str)
+            aux["CNPJ_VALIDO"] = is_valid_cnpj(aux[cnpj_col])
+            aux["TELEFONE_VALIDO"] = is_valid_phone(aux[telefone_col])
+            data_validos_por_data_ingestao = (
+                aux.groupby("DATA_INGESTAO", dropna=False)
+                .agg(
+                    CNPJ_VALIDO_PERCENTUAL=("CNPJ_VALIDO", lambda s: round(float(s.mean() * 100), 2) if s.notna().any() else 0),
+                    TELEFONE_VALIDO_PERCENTUAL=("TELEFONE_VALIDO", lambda s: round(float(s.mean() * 100), 2) if s.notna().any() else 0),
+                )
+                .reset_index()
+                .sort_values("DATA_INGESTAO")
+            )
+            data_validos_por_data_ingestao["DADOS_VALIDOS_PERCENTUAL"] = (
+                (data_validos_por_data_ingestao["CNPJ_VALIDO_PERCENTUAL"] + data_validos_por_data_ingestao["TELEFONE_VALIDO_PERCENTUAL"]) / 2
+            ).round(2)
+
+    empresas_ingeridas_por_dia_ultimos_30d = pd.DataFrame(columns=["DATA_INGESTAO", "TOTAL_EMPRESAS"])
+    if data_ingestao_col in emp.columns:
+        data_ing = pd.to_datetime(emp[data_ingestao_col], errors="coerce")
+        aux = emp.loc[data_ing.notna()].copy()
+        if not aux.empty:
+            aux["DATA_INGESTAO"] = data_ing.loc[aux.index].dt.date
+            today = datetime.now(timezone.utc).date()
+            start = (pd.Timestamp(today) - pd.Timedelta(days=30)).date()
+            aux = aux.loc[(aux["DATA_INGESTAO"] >= start) & (aux["DATA_INGESTAO"] <= today)].copy()
+            if not aux.empty:
+                empresas_ingeridas_por_dia_ultimos_30d = (
+                    aux.groupby("DATA_INGESTAO", dropna=False)
+                    .size()
+                    .reset_index(name="TOTAL_EMPRESAS")
+                    .sort_values("DATA_INGESTAO")
+                )
+                empresas_ingeridas_por_dia_ultimos_30d["DATA_INGESTAO"] = empresas_ingeridas_por_dia_ultimos_30d["DATA_INGESTAO"].astype(str)
+
+    qualidade_preenchimento_por_data_ingestao = pd.DataFrame(columns=["DATA_INGESTAO", "QUALIDADE_PREENCHIMENTO_PERCENTUAL"])
+    required_fields = [cnpj_col, uf_col, municipio_col, telefone_col, segmento_col]
+    if data_ingestao_col in emp.columns and all(col in emp.columns for col in required_fields):
+        data_ing = pd.to_datetime(emp[data_ingestao_col], errors="coerce")
+        aux = emp.loc[data_ing.notna()].copy()
+        if not aux.empty:
+            aux["DATA_INGESTAO"] = data_ing.loc[aux.index].dt.date.astype(str)
+            filled_counts = pd.DataFrame({col: is_non_empty_text(aux[col]) for col in required_fields}).sum(axis=1)
+            aux["QUALIDADE_PREENCHIMENTO_PERCENTUAL"] = (filled_counts / float(len(required_fields)) * 100).round(2)
+            qualidade_preenchimento_por_data_ingestao = (
+                aux.groupby("DATA_INGESTAO", dropna=False)
+                .agg(QUALIDADE_PREENCHIMENTO_PERCENTUAL=("QUALIDADE_PREENCHIMENTO_PERCENTUAL", "mean"))
+                .reset_index()
+                .sort_values("DATA_INGESTAO")
+            )
+            qualidade_preenchimento_por_data_ingestao["QUALIDADE_PREENCHIMENTO_PERCENTUAL"] = qualidade_preenchimento_por_data_ingestao[
+                "QUALIDADE_PREENCHIMENTO_PERCENTUAL"
+            ].round(2)
+
+    atraso_ultima_ingestao = pd.DataFrame(columns=["ULTIMA_DATA_INGESTAO", "ATRASO_DIAS"])
+    if data_ingestao_col in emp.columns:
+        data_ing = pd.to_datetime(emp[data_ingestao_col], errors="coerce")
+        if data_ing.notna().any():
+            ultima = data_ing.max().date()
+            today = datetime.now(timezone.utc).date()
+            atraso_ultima_ingestao = pd.DataFrame(
+                [{"ULTIMA_DATA_INGESTAO": ultima.isoformat(), "ATRASO_DIAS": int((today - ultima).days)}]
+            )
+
+    taxa_adocao_maquininha = pd.DataFrame(columns=["TOTAL_REGISTROS", "TOTAL_COM_MAQUININHA", "TAXA_ADOCAO_PERCENTUAL"])
+    score_medio_leads = pd.DataFrame(columns=["SCORE_LEAD_MEDIO"])
+    conversao_por_prioridade_comercial = pd.DataFrame(
+        columns=["PRIORIDADE_COMERCIAL", "TOTAL_REGISTROS", "TOTAL_CONVERTIDOS", "TAXA_CONVERSAO_PERCENTUAL"]
+    )
+    efetividade_por_canal_contato = pd.DataFrame(
+        columns=["CANAL_CONTATO_REALIZADO", "TOTAL_REGISTROS", "TOTAL_CONVERTIDOS", "TAXA_CONVERSAO_PERCENTUAL"]
+    )
+    performance_por_origem_lead = pd.DataFrame(
+        columns=["ORIGEM_LEAD", "TOTAL_REGISTROS", "TOTAL_CONVERTIDOS", "TAXA_CONVERSAO_PERCENTUAL", "SCORE_LEAD_MEDIO"]
+    )
+    tempo_medio_inatividade_dias = pd.DataFrame(columns=["TEMPO_MEDIO_INATIVIDADE_DIAS"])
+    taxa_recuperacao_clientes_inativos_ultimos_90d = pd.DataFrame(
+        columns=["TOTAL_CLIENTES_INATIVOS", "TOTAL_COM_VENDA_ULTIMOS_90D", "TAXA_RECUPERACAO_PERCENTUAL"]
+    )
+    valor_medio_por_faixa_score_lead = pd.DataFrame(
+        columns=["FAIXA_SCORE_LEAD", "TOTAL_REGISTROS", "VALOR_ULTIMA_TRANSACAO_MEDIO"]
+    )
+    distribuicao_leads_funil = pd.DataFrame(columns=["STATUS_FUNIL_VENDAS", "TOTAL_REGISTROS"])
+    produtividade_por_responsavel = pd.DataFrame(
+        columns=["RESPONSAVEL_VENDAS", "TOTAL_CONVERTIDOS", "VALOR_ULTIMA_TRANSACAO_TOTAL"]
+    )
+
+    if not crm.empty:
+        possui_col = "POSSUI_MAQUININHA"
+        score_col = "SCORE_LEAD"
+        prioridade_col = "PRIORIDADE_COMERCIAL"
+        canal_contato_col = "CANAL_CONTATO_REALIZADO"
+        status_funil_col = "STATUS_FUNIL_VENDAS"
+        origem_col = "ORIGEM_LEAD"
+        ultima_interacao_col = "ULTIMA_INTERACAO"
+        status_cliente_col = "STATUS_CLIENTE"
+        data_ultima_venda_col = "DATA_ULTIMA_VENDA"
+        valor_ultima_transacao_col = "VALOR_ULTIMA_TRANSACAO"
+        responsavel_col = "RESPONSAVEL_VENDAS"
+
+        total_crm = len(crm)
+        if possui_col in crm.columns:
+            com_maquininha = int((crm[possui_col] == "SIM").sum())
+            taxa = round((com_maquininha / total_crm) * 100, 2) if total_crm else 0
+            taxa_adocao_maquininha = pd.DataFrame(
+                [{"TOTAL_REGISTROS": int(total_crm), "TOTAL_COM_MAQUININHA": com_maquininha, "TAXA_ADOCAO_PERCENTUAL": taxa}]
+            )
+
+        if score_col in crm.columns:
+            score_num = pd.to_numeric(crm[score_col], errors="coerce")
+            score_medio_leads = pd.DataFrame(
+                [{"SCORE_LEAD_MEDIO": round(float(score_num.mean(skipna=True)), 2) if score_num.notna().any() else 0}]
+            )
+
+        converted = pd.Series([False] * len(crm), index=crm.index)
+        if status_funil_col in crm.columns:
+            converted = crm[status_funil_col].fillna("").astype(str).str.strip().eq("FECHADO")
+
+        if prioridade_col in crm.columns:
+            base = crm.copy()
+            base["CONVERTIDO"] = converted
+            conversao_por_prioridade_comercial = (
+                base.groupby(prioridade_col, dropna=False)
+                .agg(
+                    TOTAL_REGISTROS=(prioridade_col, "size"),
+                    TOTAL_CONVERTIDOS=("CONVERTIDO", lambda s: int(s.fillna(False).astype(bool).sum())),
+                )
+                .reset_index()
+                .rename(columns={prioridade_col: "PRIORIDADE_COMERCIAL"})
+            )
+            conversao_por_prioridade_comercial["TAXA_CONVERSAO_PERCENTUAL"] = (
+                (conversao_por_prioridade_comercial["TOTAL_CONVERTIDOS"] / conversao_por_prioridade_comercial["TOTAL_REGISTROS"]).fillna(0) * 100
+            ).round(2)
+            conversao_por_prioridade_comercial = conversao_por_prioridade_comercial.sort_values(
+                ["TAXA_CONVERSAO_PERCENTUAL", "TOTAL_REGISTROS"], ascending=[False, False]
+            )
+
+        if canal_contato_col in crm.columns:
+            base = crm.copy()
+            base["CONVERTIDO"] = converted
+            efetividade_por_canal_contato = (
+                base.groupby(canal_contato_col, dropna=False)
+                .agg(
+                    TOTAL_REGISTROS=(canal_contato_col, "size"),
+                    TOTAL_CONVERTIDOS=("CONVERTIDO", lambda s: int(s.fillna(False).astype(bool).sum())),
+                )
+                .reset_index()
+                .rename(columns={canal_contato_col: "CANAL_CONTATO_REALIZADO"})
+            )
+            efetividade_por_canal_contato["TAXA_CONVERSAO_PERCENTUAL"] = (
+                (efetividade_por_canal_contato["TOTAL_CONVERTIDOS"] / efetividade_por_canal_contato["TOTAL_REGISTROS"]).fillna(0) * 100
+            ).round(2)
+            efetividade_por_canal_contato = efetividade_por_canal_contato.sort_values(
+                ["TAXA_CONVERSAO_PERCENTUAL", "TOTAL_REGISTROS"], ascending=[False, False]
+            )
+
+        if origem_col in crm.columns:
+            base = crm.copy()
+            base["CONVERTIDO"] = converted
+            score_num = pd.to_numeric(base.get(score_col, pd.Series([pd.NA] * len(base), index=base.index)), errors="coerce")
+            base["SCORE_LEAD_NUM"] = score_num
+            performance_por_origem_lead = (
+                base.groupby(origem_col, dropna=False)
+                .agg(
+                    TOTAL_REGISTROS=(origem_col, "size"),
+                    TOTAL_CONVERTIDOS=("CONVERTIDO", lambda s: int(s.fillna(False).astype(bool).sum())),
+                    SCORE_LEAD_MEDIO=("SCORE_LEAD_NUM", "mean"),
+                )
+                .reset_index()
+                .rename(columns={origem_col: "ORIGEM_LEAD"})
+            )
+            performance_por_origem_lead["SCORE_LEAD_MEDIO"] = performance_por_origem_lead["SCORE_LEAD_MEDIO"].fillna(0).round(2)
+            performance_por_origem_lead["TAXA_CONVERSAO_PERCENTUAL"] = (
+                (performance_por_origem_lead["TOTAL_CONVERTIDOS"] / performance_por_origem_lead["TOTAL_REGISTROS"]).fillna(0) * 100
+            ).round(2)
+            performance_por_origem_lead = performance_por_origem_lead.sort_values(
+                ["TAXA_CONVERSAO_PERCENTUAL", "TOTAL_REGISTROS"], ascending=[False, False]
+            )
+
+        if ultima_interacao_col in crm.columns:
+            ult = pd.to_datetime(crm[ultima_interacao_col], errors="coerce")
+            now = pd.Timestamp.utcnow()
+            if getattr(now, "tzinfo", None) is not None:
+                now = now.tz_convert(None)
+            if getattr(ult.dt, "tz", None) is not None:
+                ult = ult.dt.tz_convert(None)
+            dias = (now - ult).dt.days
+            tempo_medio_inatividade_dias = pd.DataFrame(
+                [{"TEMPO_MEDIO_INATIVIDADE_DIAS": round(float(dias.mean(skipna=True)), 2) if dias.notna().any() else 0}]
+            )
+
+        if status_cliente_col in crm.columns and data_ultima_venda_col in crm.columns:
+            inativos = crm.loc[crm[status_cliente_col].fillna("").astype(str).str.strip().eq("CLIENTE INATIVO")].copy()
+            total_inativos = len(inativos)
+            if total_inativos:
+                vendas = pd.to_datetime(inativos[data_ultima_venda_col], errors="coerce")
+                now = pd.Timestamp.utcnow()
+                if getattr(now, "tzinfo", None) is not None:
+                    now = now.tz_convert(None)
+                if getattr(vendas.dt, "tz", None) is not None:
+                    vendas = vendas.dt.tz_convert(None)
+                recovered = int((vendas.notna() & (vendas >= (now - pd.Timedelta(days=90)))).sum())
+                taxa = round((recovered / total_inativos) * 100, 2)
+                taxa_recuperacao_clientes_inativos_ultimos_90d = pd.DataFrame(
+                    [
+                        {
+                            "TOTAL_CLIENTES_INATIVOS": int(total_inativos),
+                            "TOTAL_COM_VENDA_ULTIMOS_90D": recovered,
+                            "TAXA_RECUPERACAO_PERCENTUAL": taxa,
+                        }
+                    ]
+                )
+            else:
+                taxa_recuperacao_clientes_inativos_ultimos_90d = pd.DataFrame(
+                    [{"TOTAL_CLIENTES_INATIVOS": 0, "TOTAL_COM_VENDA_ULTIMOS_90D": 0, "TAXA_RECUPERACAO_PERCENTUAL": 0}]
+                )
+
+        if score_col in crm.columns and valor_ultima_transacao_col in crm.columns:
+            aux = crm[[score_col, valor_ultima_transacao_col]].copy()
+            aux["FAIXA_SCORE_LEAD"] = bucketize_score(aux[score_col])
+            aux["VALOR_ULTIMA_TRANSACAO_NUM"] = pd.to_numeric(aux[valor_ultima_transacao_col], errors="coerce")
+            aux = aux.loc[aux["FAIXA_SCORE_LEAD"].astype(str).str.strip().ne("")].copy()
+            if not aux.empty:
+                valor_medio_por_faixa_score_lead = (
+                    aux.groupby("FAIXA_SCORE_LEAD", dropna=False)
+                    .agg(
+                        TOTAL_REGISTROS=("FAIXA_SCORE_LEAD", "size"),
+                        VALOR_ULTIMA_TRANSACAO_MEDIO=("VALOR_ULTIMA_TRANSACAO_NUM", "mean"),
+                    )
+                    .reset_index()
+                    .sort_values("FAIXA_SCORE_LEAD")
+                )
+                valor_medio_por_faixa_score_lead["VALOR_ULTIMA_TRANSACAO_MEDIO"] = valor_medio_por_faixa_score_lead[
+                    "VALOR_ULTIMA_TRANSACAO_MEDIO"
+                ].fillna(0).round(2)
+
+        if status_funil_col in crm.columns:
+            distribuicao_leads_funil = (
+                crm[status_funil_col]
+                .value_counts(dropna=False)
+                .rename_axis("STATUS_FUNIL_VENDAS")
+                .reset_index(name="TOTAL_REGISTROS")
+            )
+
+        if responsavel_col in crm.columns and valor_ultima_transacao_col in crm.columns:
+            aux = crm.copy()
+            aux["CONVERTIDO"] = converted
+            aux["VALOR_ULTIMA_TRANSACAO_NUM"] = pd.to_numeric(aux[valor_ultima_transacao_col], errors="coerce")
+            aux = aux.loc[aux["CONVERTIDO"]].copy()
+            if not aux.empty:
+                produtividade_por_responsavel = (
+                    aux.groupby(responsavel_col, dropna=False)
+                    .agg(
+                        TOTAL_CONVERTIDOS=(responsavel_col, "size"),
+                        VALOR_ULTIMA_TRANSACAO_TOTAL=("VALOR_ULTIMA_TRANSACAO_NUM", "sum"),
+                    )
+                    .reset_index()
+                    .rename(columns={responsavel_col: "RESPONSAVEL_VENDAS"})
+                    .sort_values(["TOTAL_CONVERTIDOS", "VALOR_ULTIMA_TRANSACAO_TOTAL"], ascending=[False, False])
+                )
+                produtividade_por_responsavel["VALOR_ULTIMA_TRANSACAO_TOTAL"] = produtividade_por_responsavel[
+                    "VALOR_ULTIMA_TRANSACAO_TOTAL"
+                ].fillna(0).round(2)
+
+    return {
+        "volume_potencial_mensal_por_uf_segmento": volume_potencial_por_uf_segmento,
+        "top_municipios_por_volume_potencial": top_municipios_por_volume_potencial,
+        "score_prioridade_comercial": score_prioridade_comercial,
+        "segmentos_maior_ticket_medio": segmentos_maior_ticket_medio,
+        "volume_leads_contataveis_por_uf_segmento": volume_leads_contataveis_por_uf_segmento,
+        "percentual_leads_prontos_contato": percentual_leads_prontos_contato,
+        "distribuicao_leads_potencial_venda": distribuicao_leads_potencial_venda,
+        "percentual_leads_elegiveis": percentual_leads_elegiveis,
+        "dados_validos_por_data_ingestao": data_validos_por_data_ingestao,
+        "empresas_ingeridas_por_dia_ultimos_30d": empresas_ingeridas_por_dia_ultimos_30d,
+        "qualidade_preenchimento_por_data_ingestao": qualidade_preenchimento_por_data_ingestao,
+        "atraso_ultima_ingestao": atraso_ultima_ingestao,
+        "crm_taxa_adocao_maquininha": taxa_adocao_maquininha,
+        "crm_score_medio_leads": score_medio_leads,
+        "crm_conversao_por_prioridade_comercial": conversao_por_prioridade_comercial,
+        "crm_efetividade_por_canal_contato": efetividade_por_canal_contato,
+        "crm_performance_por_origem_lead": performance_por_origem_lead,
+        "crm_tempo_medio_inatividade_dias": tempo_medio_inatividade_dias,
+        "crm_taxa_recuperacao_clientes_inativos_ultimos_90d": taxa_recuperacao_clientes_inativos_ultimos_90d,
+        "crm_valor_medio_por_faixa_score_lead": valor_medio_por_faixa_score_lead,
+        "crm_distribuicao_leads_funil": distribuicao_leads_funil,
+        "crm_produtividade_por_responsavel": produtividade_por_responsavel,
+    }
 
 
 def build_gold_metrics(empresas_silver: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -535,14 +1063,15 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # no
     sns_topic_arn = DEFAULT_SNS_TOPIC_ARN
 
     try:
-        silver_bucket = payload.get("silver_bucket") or os.getenv("SILVER_BUCKET", "grupo4-silver")
+        silver_bucket = payload.get("silver_bucket") or os.getenv("SILVER_BUCKET", "spay-g4-silver")
         silver_prefix = payload.get("silver_prefix") or os.getenv("SILVER_PREFIX", "empresas/")
         silver_key = payload.get("silver_key") or os.getenv("SILVER_KEY", "")
         crm_silver_prefix = payload.get("crm_silver_prefix") or os.getenv("CRM_SILVER_PREFIX", "crm_vendas/")
         crm_silver_key = payload.get("crm_silver_key") or os.getenv("CRM_SILVER_KEY", "")
 
-        gold_bucket = payload.get("gold_bucket") or os.getenv("GOLD_BUCKET", "grupo4-gold")
+        gold_bucket = payload.get("gold_bucket") or os.getenv("GOLD_BUCKET", "spay-g4-gold")
         gold_prefix = payload.get("gold_prefix") or os.getenv("GOLD_PREFIX", "metricas_empresas/")
+        kpis_prefix = payload.get("kpis_prefix") or os.getenv("KPIS_PREFIX", "kpis_projetos/")
 
         empresas_silver = read_silver_from_s3(silver_bucket, silver_key, silver_prefix, logger)
         total_empresas_silver = len(empresas_silver)
@@ -561,11 +1090,15 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # no
 
         gold_paths = salvar_gold_no_s3(all_gold_metrics, gold_bucket, gold_prefix, logger)
 
+        kpis_metrics = build_kpis_projeto(empresas_silver, crm_silver)
+        kpis_paths = salvar_gold_no_s3(kpis_metrics, gold_bucket, kpis_prefix, logger)
+
         body = {
             "message": "Pipeline silver->gold executado com sucesso.",
             "silver_bucket": silver_bucket,
             "gold_bucket": gold_bucket,
             "gold_paths": gold_paths,
+            "kpis_paths": kpis_paths,
             "total_empresas_silver": total_empresas_silver,
             "total_registros_crm_silver": total_registros_crm_silver,
         }
@@ -579,7 +1112,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # no
                 f"Bucket gold: {gold_bucket}\n"
                 f"Registros silver lidos: {total_empresas_silver}\n"
                 f"Registros CRM silver lidos: {total_registros_crm_silver}\n"
-                f"Arquivos gold: {json.dumps(gold_paths, ensure_ascii=False)}"
+                f"Arquivos gold: {json.dumps(gold_paths, ensure_ascii=False)}\n"
+                f"Arquivos kpis_projetos: {json.dumps(kpis_paths, ensure_ascii=False)}"
             ),
             logger,
         )
